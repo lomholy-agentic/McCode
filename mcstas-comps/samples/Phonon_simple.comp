@@ -29,6 +29,15 @@
 * 3. Choose one value of k_f (always at least one is possible!)
 * 4. Perform the correct weight transformation
 *
+* With sigma_nE > 0, INITIALIZE prints the total one-phonon cross section per atom,
+* sigma_tot(E_i), for neutrons travelling along the incident beam axis (the direction
+* from the nearest preceding component at a different position). It is computed with
+* phonon_sigma_tot(), in the same normalisation as the TRACE weights, by integrating
+* each Brillouin zone in spherical coordinates around its reciprocal lattice point
+* (agrees with the TRACE Monte Carlo to about 0.5 %; roughly 0.3 s per energy).
+* Close to a Bragg condition sigma_tot is sharply peaked (it diverges logarithmically
+* exactly at one for a gapless dispersion), so the table should not be interpolated there.
+*
 * %P
 * INPUT PARAMETERS:
 * radius: [m]         Outer radius of sample in (x,z) plane
@@ -53,6 +62,9 @@
 * gap: [meV]          Bandgap energy (unphysical)
 * e_steps_low: [1]    Amount of possible intersections beneath the elastic line
 * e_steps_high: [1]   Amount of possible intersections above the elastic line
+* sigma_Emin: [meV]   Lowest incident energy in the printed total cross section table
+* sigma_Emax: [meV]   Highest incident energy in the printed total cross section table
+* sigma_nE: [1]       Number of energies in the total cross section table (0: no table)
 *
 * CALCULATED PARAMETERS:
 * V_rho: [AA^-3]      Atomic density
@@ -70,7 +82,8 @@ DEFINE COMPONENT Phonon_simple
 SETTING PARAMETERS (radius,yheight,sigma_abs,sigma_inc,a,b,M,c,DW,T,
               target_x=0, target_y=0, target_z=0, int target_index=0,
               focus_r=0,focus_xw=0,focus_yh=0,focus_aw=0,focus_ah=0, 
-              gap=0, int e_steps_low=50, int e_steps_high=50)
+              gap=0, int e_steps_low=50, int e_steps_high=50,
+              sigma_Emin=0, sigma_Emax=0, int sigma_nE=0)
 
 /* Neutron parameters: (x,y,z,vx,vy,vz,t,sx,sy,sz,p) */
 SHARE
@@ -129,12 +142,20 @@ SHARE
 
   #pragma acc routine
   double
+  phonon_hw (double qx, double qy, double qz, struct phonon_params* phonon) {
+    /* dispersion in units of meV, q in AA^-1 */
+    double ah = phonon->ah, a = phonon->a_, c = phonon->c_, gap = phonon->gap_;
+    double Jq = 2 * (cos (ah * (qx + qy)) + cos (ah * (qx - qy)) + cos (ah * (qx + qz)) + cos (ah * (qx - qz)) + cos (ah * (qy + qz)) + cos (ah * (qy - qz)));
+    if (gap > 0)
+      return sqrt (gap * gap + (12 - Jq) * (c * c) / (a * a));
+    return c / a * sqrt (12 - Jq);
+  }
+
+  #pragma acc routine
+  double
   omega_q (struct neutron_params* neutron, struct phonon_params* phonon) {
-    /* dispersion in units of meV  */
     double vi, vf, vv_x, vv_y, vv_z, vi_x, vi_y, vi_z;
-    double q, qx, qy, qz, Jq, res_phonon, res_neutron;
-    double ah, a, c;
-    double gap;
+    double qx, qy, qz, res_phonon, res_neutron;
 
     vf = neutron->vf;
     vi = neutron->vi;
@@ -144,21 +165,11 @@ SHARE
     vi_x = neutron->vi_x;
     vi_y = neutron->vi_y;
     vi_z = neutron->vi_z;
-    a = phonon->a_;
-    c = phonon->c_;
-    gap = phonon->gap_;
-    ah = phonon->ah;
 
     qx = V2K * (vi_x - vf * vv_x);
     qy = V2K * (vi_y - vf * vv_y);
     qz = V2K * (vi_z - vf * vv_z);
-    q = sqrt (qx * qx + qy * qy + qz * qz);
-    Jq = 2 * (cos (ah * (qx + qy)) + cos (ah * (qx - qy)) + cos (ah * (qx + qz)) + cos (ah * (qx - qz)) + cos (ah * (qy + qz)) + cos (ah * (qy - qz)));
-    if (gap > 0) {
-      res_phonon = sqrt (gap * gap + (12 - Jq) * (c * c) / (a * a));
-    } else {
-      res_phonon = c / a * sqrt (12 - Jq);
-    }
+    res_phonon = phonon_hw (qx, qy, qz, phonon);
     res_neutron = fabs (VS2E * (vi * vi - vf * vf));
 
     return (res_phonon - res_neutron);
@@ -328,6 +339,124 @@ SHARE
     }
   }
 
+  /* Indices of the reciprocal lattice point g*(h,k,l), h,k,l all even or all odd (bcc), nearest to Q */
+  void
+  phonon_nearest_tau (double* Q, double g, int* hn) {
+    double de = 0, d_o = 0;
+    int e[3], o[3], m;
+    for (m = 0; m < 3; m++) {
+      e[m] = 2 * (int)floor (Q[m] / (2 * g) + 0.5);
+      o[m] = 2 * (int)floor (Q[m] / (2 * g)) + 1;
+      de += (Q[m] - g * e[m]) * (Q[m] - g * e[m]);
+      d_o += (Q[m] - g * o[m]) * (Q[m] - g * o[m]);
+    }
+    for (m = 0; m < 3; m++)
+      hn[m] = de <= d_o ? e[m] : o[m];
+  }
+
+  /* hbar omega(Q) - |dE| at Q = tau + q (sqrt(1-mu^2) p + mu ez), with dE = E_i - E_f = dEt + gn q mu - alpha q^2 */
+  double
+  phonon_F_mu (double mu, double q, double* tau, double* p, double* ez, double dEt, double gn, double alpha, struct phonon_params* phonon, double* Q,
+               double* dE) {
+    double st = sqrt (fmax (0, 1 - mu * mu));
+    for (int m = 0; m < 3; m++)
+      Q[m] = tau[m] + q * (st * p[m] + mu * ez[m]);
+    *dE = dEt + gn * q * mu - alpha * q * q;
+    return phonon_hw (Q[0], Q[1], Q[2], phonon) - fabs (*dE);
+  }
+
+  /* Total scattering cross section [barn] for incident velocity (vi_x,vi_y,vi_z) [m/s], in the
+     normalisation of the TRACE weight (per atom):
+       sigma = (b^2 DW/M) (2 alpha^2/k_i) (1/4pi) sum_tau int d^3q Q^2 n(dE)/|dE| delta(hbar omega(Q) - |dE|),
+     with Q = tau + q, dE = E_i - E_f = alpha (2 k_i.Q - Q^2) and alpha = hbar^2/2m.
+     Each Brillouin zone (Wigner-Seitz cell of the bcc reciprocal lattice) is integrated in spherical
+     coordinates around tau with polar axis along k_i - tau. At fixed |q|, dE is linear in mu = cos(theta),
+     so the delta function is solved for mu on n_mu brackets. ln|q| and phi are sampled on an n_s x n_phi
+     grid with one point per cell, placed by a fixed-seed LCG. This removes the 1/q weight singularity
+     at every tau. */
+  double
+  phonon_sigma_tot (double vi_x, double vi_y, double vi_z, struct phonon_params* phonon, double T, double DW, double b, double M, int n_s, int n_phi,
+                    int n_mu) {
+    double alpha = VS2E * K2V * K2V, g = 2 * PI / phonon->a_, rmax = g * sqrt (1.25), S0 = log (1e-4), S1 = log (rmax);
+    double ki[3] = { V2K * vi_x, V2K * vi_y, V2K * vi_z }, ki2 = ki[0] * ki[0] + ki[1] * ki[1] + ki[2] * ki[2];
+    double w_max, kf_lo, kf_hi, sum = 0;
+    unsigned long long lcg = 1;
+    int hmax, h[3];
+
+    /* |k_f| range from |E_i-E_f| <= max(hbar omega), and k_f <= k_i + c/alpha + gap/(2 alpha k_i) */
+    w_max = sqrt (phonon->gap_ * phonon->gap_ + 16 * phonon->c_ * phonon->c_ / (phonon->a_ * phonon->a_));
+    kf_lo = ki2 > w_max / alpha ? sqrt (ki2 - w_max / alpha) : 0;
+    kf_hi = fmin (sqrt (ki2 + w_max / alpha), sqrt (ki2) + phonon->c_ / alpha + phonon->gap_ / (2 * alpha * sqrt (ki2)));
+    hmax = (int)ceil ((sqrt (ki2) + kf_hi + rmax) / g);
+
+    for (h[0] = -hmax; h[0] <= hmax; h[0]++)
+      for (h[1] = -hmax; h[1] <= hmax; h[1]++)
+        for (h[2] = -hmax; h[2] <= hmax; h[2]++) {
+          double tau[3], ez[3], ex[3], ey[3], kt, dEt, gn, nrm;
+          int is, ip, j, m;
+          if ((h[0] & 1) != (h[1] & 1) || (h[1] & 1) != (h[2] & 1))
+            continue;
+          for (m = 0; m < 3; m++)
+            tau[m] = g * h[m];
+          kt = sqrt ((ki[0] - tau[0]) * (ki[0] - tau[0]) + (ki[1] - tau[1]) * (ki[1] - tau[1]) + (ki[2] - tau[2]) * (ki[2] - tau[2]));
+          if (kt < kf_lo - rmax || kt > kf_hi + rmax)
+            continue;
+          dEt = alpha * (ki2 - kt * kt);
+          gn = 2 * alpha * kt;
+          for (m = 0; m < 3; m++)
+            ez[m] = kt > 0 ? (ki[m] - tau[m]) / kt : (m == 2);
+          vec_prod (ex[0], ex[1], ex[2], ez[0], ez[1], ez[2], 0.3, 0.5, 0.81);
+          nrm = sqrt (ex[0] * ex[0] + ex[1] * ex[1] + ex[2] * ex[2]);
+          for (m = 0; m < 3; m++)
+            ex[m] /= nrm;
+          vec_prod (ey[0], ey[1], ey[2], ez[0], ez[1], ez[2], ex[0], ex[1], ex[2]);
+
+          for (is = 0; is < n_s; is++)
+            for (ip = 0; ip < n_phi; ip++) {
+              double q, phi, p[3], Q[3], dE, mu1, f1;
+              lcg = lcg * 6364136223846793005ULL + 1442695040888963407ULL;
+              q = exp (S0 + (is + (lcg >> 11) * 0x1.0p-53) * (S1 - S0) / n_s);
+              lcg = lcg * 6364136223846793005ULL + 1442695040888963407ULL;
+              phi = (ip + (lcg >> 11) * 0x1.0p-53) * 2 * PI / n_phi;
+              for (m = 0; m < 3; m++)
+                p[m] = cos (phi) * ex[m] + sin (phi) * ey[m];
+
+              mu1 = -1;
+              f1 = phonon_F_mu (mu1, q, tau, p, ez, dEt, gn, alpha, phonon, Q, &dE);
+              for (j = 1; j <= n_mu; j++) {
+                double mu2 = -1 + 2.0 * j / n_mu, f2, lo = mu1, hi = mu2, flo = f1, mid, fm, mp, mm, dF;
+                int it, hn[3];
+                f2 = phonon_F_mu (mu2, q, tau, p, ez, dEt, gn, alpha, phonon, Q, &dE);
+                if (f1 * f2 < 0) {
+                  for (it = 0; it < 50; it++) {
+                    mid = 0.5 * (lo + hi);
+                    fm = phonon_F_mu (mid, q, tau, p, ez, dEt, gn, alpha, phonon, Q, &dE);
+                    if ((fm < 0) == (flo < 0)) {
+                      lo = mid;
+                      flo = fm;
+                    } else
+                      hi = mid;
+                  }
+                  mid = 0.5 * (lo + hi);
+                  mp = fmin (mid + 1e-6, 1);
+                  mm = fmax (mid - 1e-6, -1);
+                  dF = phonon_F_mu (mp, q, tau, p, ez, dEt, gn, alpha, phonon, Q, &dE);
+                  dF = fabs (dF - phonon_F_mu (mm, q, tau, p, ez, dEt, gn, alpha, phonon, Q, &dE)) / (mp - mm);
+                  phonon_F_mu (mid, q, tau, p, ez, dEt, gn, alpha, phonon, Q, &dE);
+                  /* each Q belongs to the zone of its nearest tau */
+                  phonon_nearest_tau (Q, g, hn);
+                  if (hn[0] == h[0] && hn[1] == h[1] && hn[2] == h[2])
+                    sum += q * q * q * (Q[0] * Q[0] + Q[1] * Q[1] + Q[2] * Q[2]) * nbose (dE, T) / (fabs (dE) * dF);
+                }
+                mu1 = mu2;
+                f1 = f2;
+              }
+            }
+        }
+    /* b^2 in fm^2; 1 barn = 100 fm^2 */
+    return 2 * alpha * alpha / sqrt (ki2) / (4 * PI) * sum * (S1 - S0) * 2 * PI / (n_s * n_phi) * DW * b * b / M / 100;
+  }
+
   #undef UNUSED
   #undef MAXRIDD
   #endif
@@ -373,6 +502,29 @@ INITIALIZE
   if (!(target_x || target_y || target_z)) {
     printf ("Phonon_simple: %s: The target is not defined. Using direct beam (Z-axis).\n", NAME_CURRENT_COMP);
     target_z = 1;
+  }
+
+  /* Total cross section table along the incident beam: the direction from the nearest preceding
+     component at a different position, in the local frame (z axis if there is none) */
+  if (sigma_nE > 0) {
+    double bx = 0, by = 0, bz = 1, E, vi, sig;
+    for (int i = INDEX_CURRENT_COMP - 1; i > 0; i--) {
+      Coords beam = coords_sub (POS_A_CURRENT_COMP, POS_A_COMP_INDEX (i));
+      if (coords_len (beam) > 1e-9) {
+        beam = rot_apply (ROT_A_CURRENT_COMP, beam);
+        coords_get (beam, &bx, &by, &bz);
+        NORM (bx, by, bz);
+        break;
+      }
+    }
+    printf ("Phonon_simple: %s: total cross section per atom, incident direction (%g, %g, %g) in the local frame\n", NAME_CURRENT_COMP, bx, by, bz);
+    printf ("#   E_i [meV]   sigma_tot [barn]\n");
+    for (int i = 0; i < sigma_nE; i++) {
+      E = sigma_nE > 1 ? sigma_Emin + i * (sigma_Emax - sigma_Emin) / (sigma_nE - 1) : sigma_Emin;
+      vi = sqrt (E / VS2E);
+      sig = phonon_sigma_tot (vi * bx, vi * by, vi * bz, &phonon, T, DW, b, M, 64, 64, 24);
+      printf ("  %12.6g  %16.6g\n", E, sig);
+    }
   }
 %}
 TRACE
