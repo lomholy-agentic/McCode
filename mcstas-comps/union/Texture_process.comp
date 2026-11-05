@@ -66,7 +66,7 @@
 *   rot_x_expr = "p1*sqrt(-2*log(1-u1))*cos(2*pi*u2)", rot_y_expr = "0", rot_z_expr = "360*u3".
 * The noise of the drawn texture falls as 1/sqrt(n_orientations) and grows as orientation_sigma
 * decreases, so the number of orientations needed grows about as orientation_sigma^-3. For this
-* example with p1 = 5 in Test_texture_white_beam (Al), the noise stays below a statistical error of
+* example with p1 = 5 in Test_texture_Al_sphere (Al), the noise stays below a statistical error of
 * about 5% of the intensity on 30 x 30 deg patches of sphere_det with 1000 orientations at
 * orientation_sigma = 10 deg, and needs about 30000 at 3 deg (with lmax_user = 30); the default
 * 10000 thus suffices down to about 5 deg. A k times smaller statistical error needs about k^2
