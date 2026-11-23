@@ -53,7 +53,8 @@
 * %Parameters
 * odf_file:   [string] Fourier coefficients of the texture, fcoef_fn of Texture_process
 * half_cone:  [1]    1: use Al_half_cone_111_ODF.bin, the right half of the (111) cone, instead, see above
-* crystal:    [string] Crystal structure file of Texture_process, an NCrystal material or a LAZ file
+* crystal:    [string] Crystal structure file of Texture_process, an NCrystal material or a LAZ file, or a LAU file
+*                     (|F|^2 in fm^2, read with barns=0); Single_crystal_process needs a LAU file, which lists every hkl
 * use_powder: [1]    1: Powder_process reading crystal instead of Texture_process
 * lmax_user:  [1]    Cut-off of the Fourier series, see Texture_process
 * mosaic:     [arcmin] Isotropic mosaic of Single_crystal_process (FWHM), with use_single_cryst=1
@@ -85,6 +86,7 @@ DECLARE
   double det_r;
   int scattered;
   int use_texture;
+  int crystal_barns;
 %}
 
 INITIALIZE
@@ -106,6 +108,9 @@ INITIALIZE
     process_tilt = -90;
     texture_file = "Al_half_cone_111_ODF.bin";
   }
+
+  // LAU files give |F|^2 in fm^2, LAZ files |F| in barn^0.5
+  crystal_barns = !strstr (crystal, ".lau");
 
   use_texture = 1;
   if (use_single_cryst || use_powder){
@@ -142,7 +147,7 @@ COMPONENT arm_sample = Arm(
 ) AT (0, 0, 0.025) RELATIVE slit
 
 COMPONENT texture = Texture_process(
-    crystal_fn = crystal, barns = 1,
+    crystal_fn = crystal, barns = crystal_barns,
     fcoef_fn = texture_file, lmax_user = lmax_user, lambda_min = lambda_min, mtex_axes = !half_cone,
     split_optimization = split_optimization,
     ax = axis_a[0], ay = axis_a[1], az = axis_a[2], bx = axis_b[0], by = axis_b[1], bz = axis_b[2]
@@ -154,7 +159,7 @@ COMPONENT texture_mat = Union_make_material(
 ) AT (0, 0, 0) RELATIVE arm_sample
 
 COMPONENT powder = Powder_process(
-    reflections = crystal, barns = 1, packing_factor = 1
+    reflections = crystal, barns = crystal_barns, packing_factor = 1
 ) AT (0, 0, 0) RELATIVE arm_sample
 
 COMPONENT powder_mat = Union_make_material(
@@ -162,7 +167,7 @@ COMPONENT powder_mat = Union_make_material(
 ) AT (0, 0, 0) RELATIVE arm_sample
 
 COMPONENT single_cryst = Single_crystal_process(
-    reflections = crystal, barns = 1,
+    reflections = crystal, barns = crystal_barns,
     mosaic = mosaic,
     recip_cell=0,
     ax = axis_a[0], ay = axis_a[1], az = axis_a[2], bx = axis_b[0], by = axis_b[1], bz = axis_b[2]
